@@ -1,0 +1,27 @@
+[package]
+name = "nc-sync"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+dirs = "7.0.0"
+futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
+notify = "8.2.1"
+notify-rust = { version = "4.18.2", default-features = false, features = ["z-with-tokio"] }
+oo7 = { version = "0.6.0", default-features = false, features = ["tokio", "native_crypto"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "form"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["rt", "macros", "process", "time", "sync", "fs", "io-util"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+toml = "1.1.8"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+url = { version = "2.5.8", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["test-util"] }
