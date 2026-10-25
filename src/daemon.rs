@@ -104,34 +104,32 @@ async fn session(config: &Config, client: &Client, credentials: Credentials) -> 
         triggers.clone(),
     ));
 
-    let mut problem_reported = false;
+    // failed syncs in a row; problems are reported once and retried with a growing delay
+    let mut failures = 0;
     loop {
-        match sync(&bisync, Mode::Normal, client, &credentials).await? {
-            Outcome::Synced { conflicts } => {
-                problem_reported = false;
-                if conflicts > 0 {
-                    desktop::notify(
-                        "Sync conflicts",
-                        &format!(
-                            "{conflicts} file(s) changed on both sides. The newer version won, \
-                             the older one was kept with a .conflict suffix."
-                        ),
-                    )
-                    .await;
-                }
+        let outcome = sync(&bisync, Mode::Normal, client, &credentials).await?;
+        match &outcome {
+            Outcome::Synced { conflicts } if *conflicts > 0 => {
+                desktop::notify(
+                    "Sync conflicts",
+                    &format!(
+                        "{conflicts} file(s) changed on both sides. The newer version won, \
+                         the older one was kept with a .conflict suffix."
+                    ),
+                )
+                .await;
             }
+            Outcome::Synced { .. } => {}
             Outcome::Unauthorized => return Ok(()),
-            Outcome::SafetyAbort { reason, forceable } if !problem_reported => {
-                problem_reported = true;
-                let hint = if forceable {
+            Outcome::SafetyAbort { reason, forceable } if failures == 0 => {
+                let hint = if *forceable {
                     "\nRun `nc-sync sync --force` if that is intended."
                 } else {
                     ""
                 };
                 desktop::notify("Nextcloud sync paused", &format!("{reason}{hint}")).await;
             }
-            Outcome::NeedsResync | Outcome::Failed(_) if !problem_reported => {
-                problem_reported = true;
+            Outcome::NeedsResync | Outcome::Failed(_) if failures == 0 => {
                 desktop::notify(
                     "Nextcloud sync failed",
                     "See `journalctl --user -u nc-sync`.",
@@ -140,11 +138,41 @@ async fn session(config: &Config, client: &Client, credentials: Credentials) -> 
             }
             _ => {}
         }
-        let trigger = next_trigger(&mut events, config.debounce(), config.interval()).await;
-        if trigger == Trigger::Unauthorized {
-            return Ok(());
+
+        if matches!(outcome, Outcome::Synced { .. }) {
+            failures = 0;
+            let trigger = next_trigger(&mut events, config.debounce(), config.interval()).await;
+            if trigger == Trigger::Unauthorized {
+                return Ok(());
+            }
+        } else {
+            // a failed run leaves triggers from its own transfers behind; retrying on
+            // them would repeat a long failing sync back to back
+            failures += 1;
+            let delay = retry_delay(failures, config.interval());
+            tracing::info!("retrying in {}s", delay.as_secs());
+            tokio::time::sleep(delay).await;
+            if drain(&mut events) {
+                return Ok(());
+            }
         }
     }
+}
+
+/// One minute after the first failure, doubling up to the sync interval.
+fn retry_delay(failures: u32, max: Duration) -> Duration {
+    Duration::from_secs(60)
+        .saturating_mul(2u32.saturating_pow(failures.saturating_sub(1)))
+        .min(max)
+}
+
+/// Drops queued triggers, as the coming sync covers them. True if one was `Unauthorized`.
+fn drain(events: &mut Receiver<Trigger>) -> bool {
+    let mut unauthorized = false;
+    while let Ok(trigger) = events.try_recv() {
+        unauthorized |= trigger == Trigger::Unauthorized;
+    }
+    unauthorized
 }
 
 /// Waits for a trigger, or `idle` without one, then for things to settle.
@@ -199,6 +227,23 @@ mod tests {
 
     const QUIET: Duration = Duration::from_secs(3);
     const IDLE: Duration = Duration::from_secs(300);
+
+    #[test]
+    fn retry_delay_doubles_up_to_the_interval() {
+        let delays: Vec<u64> = (1..=6).map(|n| retry_delay(n, IDLE).as_secs()).collect();
+        assert_eq!(delays, [60, 120, 240, 300, 300, 300]);
+    }
+
+    #[test]
+    fn draining_reports_unauthorized() {
+        let (tx, mut rx) = mpsc::channel(TRIGGER_QUEUE);
+        tx.try_send(Trigger::Local).unwrap();
+        tx.try_send(Trigger::Unauthorized).unwrap();
+        tx.try_send(Trigger::Remote).unwrap();
+        assert!(drain(&mut rx));
+        assert!(rx.try_recv().is_err());
+        assert!(!drain(&mut rx));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn bursts_collapse_into_one_trigger() {
