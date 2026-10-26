@@ -73,11 +73,15 @@ pub struct Config {
     pub state_dir: Option<PathBuf>,
 
     /// Show a status icon in the system tray.
-    #[serde(default = "default_tray")]
+    #[serde(default = "default_true")]
     pub tray: bool,
+
+    /// Hold syncs while NetworkManager reports a metered connection.
+    #[serde(default = "default_true")]
+    pub pause_on_metered: bool,
 }
 
-fn default_tray() -> bool {
+fn default_true() -> bool {
     true
 }
 
@@ -166,6 +170,7 @@ mod tests {
         assert_eq!(config.interval, 300);
         assert_eq!(config.debounce, 3);
         assert!(config.tray);
+        assert!(config.pause_on_metered);
     }
 
     #[test]

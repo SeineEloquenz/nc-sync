@@ -20,6 +20,7 @@ let
     exclude = cfg.exclude;
     rclone_args = cfg.rcloneArgs;
     tray = cfg.tray;
+    pause_on_metered = cfg.pauseOnMetered;
   };
 in
 {
@@ -95,6 +96,16 @@ in
       description = ''
         Whether to show a status icon in the system tray. On if unset. GNOME needs the
         AppIndicator extension to display it.
+      '';
+    };
+
+    pauseOnMetered = lib.mkOption {
+      type = lib.types.nullOr lib.types.bool;
+      default = null;
+      example = false;
+      description = ''
+        Whether to hold syncs while NetworkManager reports a metered connection, such
+        as a phone hotspot. "Sync now" in the tray still runs a single sync. On if unset.
       '';
     };
   };

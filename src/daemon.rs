@@ -13,6 +13,7 @@ use url::Url;
 use crate::config::Config;
 use crate::credentials::{self, Credentials};
 use crate::desktop;
+use crate::network;
 use crate::nextcloud::{self, LoginFlow};
 use crate::push;
 use crate::rclone::{Bisync, Mode, Outcome};
@@ -40,28 +41,71 @@ pub enum Trigger {
     Manual,
 }
 
-/// Holds syncing until it is switched off again. A file in the state dir keeps the
-/// switch across restarts.
+/// Why syncing is held back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Hold {
+    /// The user paused it.
+    pub manual: bool,
+    /// The connection is metered.
+    pub metered: bool,
+}
+
+impl Hold {
+    pub fn any(self) -> bool {
+        self.manual || self.metered
+    }
+}
+
+/// Holds syncing while the user paused it or the connection is metered. Only the user's
+/// pause is kept across restarts, in a file in the state dir; whether the connection is
+/// metered is looked up again on every start.
 #[derive(Clone)]
 pub struct Pause {
     file: PathBuf,
-    switch: Arc<Switch<bool>>,
+    switch: Arc<Switch<Hold>>,
 }
 
 impl Pause {
     pub fn load(file: PathBuf) -> Self {
-        let paused = file.exists();
+        let hold = Hold {
+            manual: file.exists(),
+            metered: false,
+        };
         Self {
             file,
-            switch: Arc::new(Switch::new(paused)),
+            switch: Arc::new(Switch::new(hold)),
         }
     }
 
-    pub fn is_paused(&self) -> bool {
+    pub fn hold(&self) -> Hold {
         *self.switch.borrow()
     }
 
-    /// A failure to save only costs the switch its persistence, so it is just logged.
+    /// Whether the user paused syncing.
+    pub fn is_paused(&self) -> bool {
+        self.hold().manual
+    }
+
+    pub fn set_metered(&self, metered: bool) {
+        let changed = self.switch.send_if_modified(|hold| {
+            let changed = hold.metered != metered;
+            hold.metered = metered;
+            changed
+        });
+        if changed {
+            tracing::info!(
+                "{}",
+                if metered {
+                    "the connection is metered, holding syncs"
+                } else {
+                    "the connection is no longer metered"
+                }
+            );
+        }
+    }
+
+    /// The user's pause. A failure to save only costs it its persistence, so it is
+    /// just logged.
     pub fn set(&self, paused: bool) {
         let saved = if paused {
             // before the first sync the state dir may not exist yet
@@ -79,14 +123,29 @@ impl Pause {
             tracing::warn!("saving the pause in {}: {err}", self.file.display());
         }
         tracing::info!("{}", if paused { "pausing" } else { "resuming" });
-        self.switch.send_replace(paused);
+        self.switch.send_modify(|hold| hold.manual = paused);
     }
 
-    /// Returns once syncing is not paused.
-    async fn resumed(&self) {
-        let mut receiver = self.switch.subscribe();
-        // the sender lives in self, so the channel cannot close while waiting
-        let _ = receiver.wait_for(|paused| !paused).await;
+    /// Waits while syncing is held. "Sync now" still runs one sync on a metered
+    /// connection, but not while the user paused. True if a trigger was `Unauthorized`.
+    async fn released(&self, events: &mut Receiver<Trigger>) -> bool {
+        let mut hold = self.switch.subscribe();
+        loop {
+            let current = *hold.borrow_and_update();
+            if !current.any() {
+                // the coming sync covers whatever changed meanwhile
+                return drain(events);
+            }
+            tokio::select! {
+                // the sender lives in self, so the channel cannot close while waiting
+                _ = hold.changed() => {}
+                trigger = events.recv() => match trigger.expect("the daemon holds a sender") {
+                    Trigger::Unauthorized => return true,
+                    Trigger::Manual if !current.manual => return drain(events),
+                    _ => {}
+                },
+            }
+        }
     }
 }
 
@@ -102,6 +161,9 @@ pub async fn run(config: Config, client: Client) -> Result<()> {
     let (triggers, events) = mpsc::channel(TRIGGER_QUEUE);
     let pause = Pause::load(config.pause_file());
     let indicator = Indicator::spawn(&config, triggers.clone(), pause.clone()).await;
+    if config.pause_on_metered {
+        tokio::spawn(network::follow_metered(pause.clone(), indicator.clone()));
+    }
     let mut control = Control {
         triggers,
         events,
@@ -198,12 +260,8 @@ async fn session(
     // failed syncs in a row; problems are reported once and retried with a growing delay
     let mut failures = 0;
     loop {
-        if pause.is_paused() {
-            pause.resumed().await;
-            // the coming sync covers whatever changed meanwhile
-            if drain(events) {
-                return Ok(());
-            }
+        if pause.hold().any() && pause.released(events).await {
+            return Ok(());
         }
 
         indicator.set(State::Syncing).await;
@@ -468,15 +526,69 @@ mod tests {
         assert!(file.exists());
         assert!(Pause::load(file.clone()).is_paused());
 
+        let (_tx, mut rx) = mpsc::channel(TRIGGER_QUEUE);
         let waiting = tokio::spawn({
             let pause = pause.clone();
-            async move { pause.resumed().await }
+            async move { pause.released(&mut rx).await }
         });
         tokio::task::yield_now().await;
         assert!(!waiting.is_finished());
         pause.set(false);
-        waiting.await.unwrap();
+        assert!(!waiting.await.unwrap());
         assert!(!file.exists());
         assert!(!Pause::load(file).is_paused());
+    }
+
+    #[tokio::test]
+    async fn metered_holds_until_unmetered_and_is_not_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("paused");
+        let pause = Pause::load(file.clone());
+        pause.set_metered(true);
+        assert!(pause.hold().any() && !pause.is_paused());
+        assert!(!file.exists());
+
+        let (_tx, mut rx) = mpsc::channel(TRIGGER_QUEUE);
+        let waiting = tokio::spawn({
+            let pause = pause.clone();
+            async move { pause.released(&mut rx).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        pause.set_metered(false);
+        assert!(!waiting.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn sync_now_overrides_metered_but_not_a_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let pause = Pause::load(dir.path().join("paused"));
+        pause.set_metered(true);
+        let (tx, mut rx) = mpsc::channel(TRIGGER_QUEUE);
+        tx.send(Trigger::Manual).await.unwrap();
+        assert!(!pause.released(&mut rx).await);
+
+        // paused by the user, "Sync now" is ignored until resumed
+        pause.set(true);
+        tx.send(Trigger::Manual).await.unwrap();
+        let waiting = tokio::spawn({
+            let pause = pause.clone();
+            async move { pause.released(&mut rx).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        pause.set(false);
+        pause.set_metered(false);
+        assert!(!waiting.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn unauthorized_ends_a_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let pause = Pause::load(dir.path().join("paused"));
+        pause.set(true);
+        let (tx, mut rx) = mpsc::channel(TRIGGER_QUEUE);
+        tx.send(Trigger::Unauthorized).await.unwrap();
+        assert!(pause.released(&mut rx).await);
     }
 }

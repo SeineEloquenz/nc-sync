@@ -27,6 +27,7 @@ it needs the AppIndicator extension.
 | The server cannot be reached | The tray shows it as offline, no notification; retried every minute |
 | The server has no notify_push | Remote changes are picked up by the periodic sync only |
 | Paused from the tray | No syncs until resumed, also across restarts; resuming syncs right away |
+| The connection is metered (NetworkManager) | Syncs are held until it is not; "Sync now" runs one anyway |
 
 Temporary, lock and old-client files (`.sync_*.db`, `.~lock.*`, `*.part`, …) never sync;
 see `DEFAULT_EXCLUDES` in `src/config.rs`.
@@ -51,6 +52,7 @@ debounce = 3              # seconds of quiet before a sync starts
 exclude = ["*.iso"]       # extra rclone filter patterns
 rclone_args = []          # extra arguments for rclone bisync
 tray = true               # status icon in the system tray
+pause_on_metered = true   # hold syncs on metered connections
 ```
 
 ## Home Manager

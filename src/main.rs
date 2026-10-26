@@ -2,6 +2,7 @@ mod config;
 mod credentials;
 mod daemon;
 mod desktop;
+mod network;
 mod nextcloud;
 mod push;
 mod rclone;

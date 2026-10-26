@@ -33,6 +33,7 @@ pub enum State {
 }
 
 /// Forwards the daemon's state to the tray, or does nothing without one.
+#[derive(Clone)]
 pub struct Indicator(Option<Handle<NcTray>>);
 
 impl Indicator {
@@ -78,6 +79,13 @@ impl Indicator {
         }
     }
 
+    /// Redraws after a change the tray reads from elsewhere, such as the pause.
+    pub async fn refresh(&self) {
+        if let Some(handle) = &self.0 {
+            handle.update(|_| ()).await;
+        }
+    }
+
     /// A finished sync; `conflicts` are relative to the synced folder.
     pub async fn synced(&self, conflicts: &[PathBuf]) {
         if let Some(handle) = &self.0 {
@@ -115,6 +123,7 @@ impl NcTray {
             State::LoginNeeded => Shown::LoginNeeded,
             State::Syncing => Shown::Syncing,
             _ if self.pause.is_paused() => Shown::Paused,
+            _ if self.pause.hold().metered => Shown::Metered,
             State::Starting => Shown::Starting,
             State::InSync => Shown::InSync,
             State::Failed(reason) => Shown::Failed(reason),
@@ -133,6 +142,7 @@ impl NcTray {
             Shown::Syncing => "Syncing…".into(),
             Shown::InSync => format!("In sync{since}"),
             Shown::Paused => format!("Paused{since}"),
+            Shown::Metered => format!("Paused on a metered connection{since}"),
             Shown::Failed(reason) => format!("Sync failed, retrying: {}", shorten(reason)),
             Shown::Offline => format!("Can't reach the server{since}"),
             Shown::LoginNeeded => "Log in to continue syncing".into(),
@@ -145,6 +155,7 @@ enum Shown<'a> {
     Syncing,
     InSync,
     Paused,
+    Metered,
     Failed(&'a str),
     Offline,
     LoginNeeded,
@@ -165,7 +176,7 @@ impl ksni::Tray for NcTray {
         match self.shown() {
             Shown::Starting | Shown::InSync => "folder-remote-symbolic",
             Shown::Syncing => "view-refresh-symbolic",
-            Shown::Paused => "media-playback-pause-symbolic",
+            Shown::Paused | Shown::Metered => "media-playback-pause-symbolic",
             Shown::Failed(_) => "dialog-warning-symbolic",
             Shown::Offline => "network-offline-symbolic",
             Shown::LoginNeeded => "dialog-password-symbolic",
