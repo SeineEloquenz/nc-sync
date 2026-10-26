@@ -180,6 +180,14 @@ pub async fn authorized(client: &Client, credentials: &Credentials) -> Result<bo
     }
 }
 
+/// Whether `err` comes from a request that never got an answer: no network, no DNS,
+/// or a server that is down. Any HTTP status means the server was reachable.
+pub fn is_unreachable(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
+        .any(|err| err.is_connect() || err.is_timeout())
+}
+
 /// Revokes the app password on the server, so the device disappears from its session list.
 pub async fn revoke(client: &Client, credentials: &Credentials) -> Result<()> {
     client
@@ -235,5 +243,24 @@ mod tests {
         let parsed: FlowResult = serde_json::from_str(body).unwrap();
         assert_eq!(parsed.login_name, "jane");
         assert_eq!(parsed.app_password, "secret");
+    }
+
+    #[tokio::test]
+    async fn refused_connections_count_as_unreachable() {
+        // main installs the TLS provider; another test may already have done so here
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // plain HTTP only, so no system certificates, which the Nix build sandbox lacks
+        let client = Client::builder().tls_certs_only([]).build().unwrap();
+        // nothing listens on port 1, so the connection is refused right away
+        let err = client
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .context("checking the app password")
+            .unwrap_err();
+        assert!(is_unreachable(&err));
+        assert!(!is_unreachable(&anyhow::anyhow!(
+            "checking the app password: 500 Internal Server Error"
+        )));
     }
 }

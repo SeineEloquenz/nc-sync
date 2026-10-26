@@ -74,6 +74,7 @@ async fn main() -> Result<()> {
             };
             match daemon::sync(&bisync, mode, &client, &credentials).await? {
                 Outcome::Synced { .. } => Ok(()),
+                Outcome::Unreachable => bail!("cannot reach the server"),
                 Outcome::Unauthorized => {
                     bail!("the server rejected the app password, run `nc-sync login`")
                 }

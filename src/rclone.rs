@@ -55,6 +55,8 @@ pub enum Outcome {
     /// The server rejected the app password. rclone cannot tell this apart from
     /// other failures, so the caller sets it after asking the server.
     Unauthorized,
+    /// The server could not be reached at all, set by the caller like `Unauthorized`.
+    Unreachable,
     Failed(String),
 }
 

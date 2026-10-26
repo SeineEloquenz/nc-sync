@@ -25,6 +25,9 @@ const MAX_DEBOUNCE: Duration = Duration::from_secs(60);
 /// Triggers carry no data, so a short queue is enough; senders drop extras.
 const TRIGGER_QUEUE: usize = 16;
 
+/// How often a sync is retried while the server cannot be reached.
+const OFFLINE_RETRY: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
     Local,
@@ -216,6 +219,7 @@ async fn session(
                     .await
             }
             Outcome::Failed(err) => indicator.set(State::Failed(err.clone())).await,
+            Outcome::Unreachable => indicator.set(State::Offline).await,
             Outcome::Unauthorized => {}
         }
         match &outcome {
@@ -254,6 +258,13 @@ async fn session(
             failures = 0;
             let trigger = next_trigger(events, config.debounce(), config.interval()).await;
             if trigger == Trigger::Unauthorized {
+                return Ok(());
+            }
+        } else if outcome == Outcome::Unreachable {
+            // being offline is no failure worth reporting, and a run against an
+            // unreachable server ends quickly, so it is simply tried again soon
+            tracing::info!("retrying in {}s", OFFLINE_RETRY.as_secs());
+            if retry_wait(events, OFFLINE_RETRY).await {
                 return Ok(());
             }
         } else {
@@ -329,10 +340,12 @@ pub async fn sync(
     credentials: &Credentials,
 ) -> Result<Outcome> {
     let mut outcome = bisync.sync(mode).await.context("running bisync")?;
-    if matches!(outcome, Outcome::Failed(_))
-        && matches!(nextcloud::authorized(client, credentials).await, Ok(false))
-    {
-        outcome = Outcome::Unauthorized;
+    if matches!(outcome, Outcome::Failed(_)) {
+        match nextcloud::authorized(client, credentials).await {
+            Ok(false) => outcome = Outcome::Unauthorized,
+            Err(err) if nextcloud::is_unreachable(&err) => outcome = Outcome::Unreachable,
+            _ => {}
+        }
     }
     match &outcome {
         Outcome::Synced { conflicts } => {
@@ -341,6 +354,7 @@ pub async fn sync(
         Outcome::NeedsResync => tracing::error!("bisync still needs a resync after one"),
         Outcome::SafetyAbort { reason, .. } => tracing::error!("{reason}"),
         Outcome::Unauthorized => tracing::error!("the server rejected the app password"),
+        Outcome::Unreachable => tracing::warn!("cannot reach the server"),
         Outcome::Failed(err) => tracing::error!("sync failed: {err}"),
     }
     Ok(outcome)

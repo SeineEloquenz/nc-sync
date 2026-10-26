@@ -24,6 +24,7 @@ it needs the AppIndicator extension.
 | More than half the files would be deleted | Sync pauses; `nc-sync sync --force` continues |
 | One side is completely empty | Sync refuses, even with `--force` |
 | The app password was revoked | The keyring entry is removed and a login notification appears |
+| The server cannot be reached | The tray shows it as offline, no notification; retried every minute |
 | The server has no notify_push | Remote changes are picked up by the periodic sync only |
 | Paused from the tray | No syncs until resumed, also across restarts; resuming syncs right away |
 

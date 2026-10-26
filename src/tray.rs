@@ -27,6 +27,8 @@ pub enum State {
     InSync,
     /// The last sync did not finish; the daemon retries on its own.
     Failed(String),
+    /// The server cannot be reached; the daemon retries every minute.
+    Offline,
     LoginNeeded,
 }
 
@@ -116,6 +118,7 @@ impl NcTray {
             State::Starting => Shown::Starting,
             State::InSync => Shown::InSync,
             State::Failed(reason) => Shown::Failed(reason),
+            State::Offline => Shown::Offline,
         }
     }
 
@@ -131,6 +134,7 @@ impl NcTray {
             Shown::InSync => format!("In sync{since}"),
             Shown::Paused => format!("Paused{since}"),
             Shown::Failed(reason) => format!("Sync failed, retrying: {}", shorten(reason)),
+            Shown::Offline => format!("Can't reach the server{since}"),
             Shown::LoginNeeded => "Log in to continue syncing".into(),
         }
     }
@@ -142,6 +146,7 @@ enum Shown<'a> {
     InSync,
     Paused,
     Failed(&'a str),
+    Offline,
     LoginNeeded,
 }
 
@@ -162,6 +167,7 @@ impl ksni::Tray for NcTray {
             Shown::Syncing => "view-refresh-symbolic",
             Shown::Paused => "media-playback-pause-symbolic",
             Shown::Failed(_) => "dialog-warning-symbolic",
+            Shown::Offline => "network-offline-symbolic",
             Shown::LoginNeeded => "dialog-password-symbolic",
         }
         .into()
@@ -177,7 +183,11 @@ impl ksni::Tray for NcTray {
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
         let paused = self.pause.is_paused();
-        let can_sync = !paused && matches!(self.state, State::InSync | State::Failed(_));
+        let can_sync = !paused
+            && matches!(
+                self.state,
+                State::InSync | State::Failed(_) | State::Offline
+            );
         let mut menu = vec![
             StandardItem {
                 label: escape(&self.summary()),
