@@ -1,8 +1,11 @@
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use reqwest::Client;
-use tokio::sync::mpsc::{self, Receiver};
+use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::watch::Sender as Switch;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use url::Url;
@@ -13,6 +16,7 @@ use crate::desktop;
 use crate::nextcloud::{self, LoginFlow};
 use crate::push;
 use crate::rclone::{Bisync, Mode, Outcome};
+use crate::tray::{Indicator, State};
 use crate::watch;
 
 /// A sync starts at the latest this long after the first change, even if changes keep coming.
@@ -29,16 +33,89 @@ pub enum Trigger {
     Timer,
     /// The server rejected the app password.
     Unauthorized,
+    /// The user asked for a sync; it starts without waiting for things to settle.
+    Manual,
+}
+
+/// Holds syncing until it is switched off again. A file in the state dir keeps the
+/// switch across restarts.
+#[derive(Clone)]
+pub struct Pause {
+    file: PathBuf,
+    switch: Arc<Switch<bool>>,
+}
+
+impl Pause {
+    pub fn load(file: PathBuf) -> Self {
+        let paused = file.exists();
+        Self {
+            file,
+            switch: Arc::new(Switch::new(paused)),
+        }
+    }
+
+    pub fn is_paused(&self) -> bool {
+        *self.switch.borrow()
+    }
+
+    /// A failure to save only costs the switch its persistence, so it is just logged.
+    pub fn set(&self, paused: bool) {
+        let saved = if paused {
+            // before the first sync the state dir may not exist yet
+            self.file
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&self.file, ""))
+        } else {
+            std::fs::remove_file(&self.file).or_else(|err| match err.kind() {
+                std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(err),
+            })
+        };
+        if let Err(err) = saved {
+            tracing::warn!("saving the pause in {}: {err}", self.file.display());
+        }
+        tracing::info!("{}", if paused { "pausing" } else { "resuming" });
+        self.switch.send_replace(paused);
+    }
+
+    /// Returns once syncing is not paused.
+    async fn resumed(&self) {
+        let mut receiver = self.switch.subscribe();
+        // the sender lives in self, so the channel cannot close while waiting
+        let _ = receiver.wait_for(|paused| !paused).await;
+    }
+}
+
+/// What outlives a session: the trigger queue the tray also feeds, the pause and the tray.
+struct Control {
+    triggers: Sender<Trigger>,
+    events: Receiver<Trigger>,
+    pause: Pause,
+    indicator: Indicator,
 }
 
 pub async fn run(config: Config, client: Client) -> Result<()> {
+    let (triggers, events) = mpsc::channel(TRIGGER_QUEUE);
+    let pause = Pause::load(config.pause_file());
+    let indicator = Indicator::spawn(&config, triggers.clone(), pause.clone()).await;
+    let mut control = Control {
+        triggers,
+        events,
+        pause,
+        indicator,
+    };
     loop {
         let credentials = match credentials::load(&config.server).await? {
             Some(credentials) => credentials,
-            None => login(&client, &config.server, Prompt::Notification).await?,
+            None => {
+                control.indicator.set(State::LoginNeeded).await;
+                login(&client, &config.server, Prompt::Notification).await?
+            }
         };
-        session(&config, &client, credentials).await?;
+        session(&config, &client, credentials, &mut control).await?;
         // the only way a session ends without an error is a rejected app password
+        control.indicator.set(State::LoginNeeded).await;
         desktop::notify(
             "Nextcloud access was revoked",
             "Log in again to continue syncing.",
@@ -84,10 +161,21 @@ pub async fn login(client: &Client, server: &Url, prompt: Prompt) -> Result<Cred
 }
 
 /// Syncs on start and on every trigger until the server rejects the credentials.
-async fn session(config: &Config, client: &Client, credentials: Credentials) -> Result<()> {
+async fn session(
+    config: &Config,
+    client: &Client,
+    credentials: Credentials,
+    control: &mut Control,
+) -> Result<()> {
     let bisync = Bisync::nextcloud(config, &credentials).await?;
-    // the session keeps a sender, so the queue stays open even if every source stops
-    let (triggers, mut events) = mpsc::channel(TRIGGER_QUEUE);
+    // anything queued before this session is covered by its first sync
+    drain(&mut control.events);
+    let Control {
+        triggers,
+        events,
+        pause,
+        indicator,
+    } = control;
 
     // adding a watch per directory walks the whole tree, so keep it off the runtime
     let (dir, sender) = (config.local_dir.clone(), triggers.clone());
@@ -107,14 +195,37 @@ async fn session(config: &Config, client: &Client, credentials: Credentials) -> 
     // failed syncs in a row; problems are reported once and retried with a growing delay
     let mut failures = 0;
     loop {
+        if pause.is_paused() {
+            pause.resumed().await;
+            // the coming sync covers whatever changed meanwhile
+            if drain(events) {
+                return Ok(());
+            }
+        }
+
+        indicator.set(State::Syncing).await;
         let outcome = sync(&bisync, Mode::Normal, client, &credentials).await?;
         match &outcome {
-            Outcome::Synced { conflicts } if *conflicts > 0 => {
+            Outcome::Synced { conflicts } => indicator.synced(conflicts).await,
+            Outcome::SafetyAbort { reason, .. } => {
+                indicator.set(State::Failed(reason.clone())).await
+            }
+            Outcome::NeedsResync => {
+                indicator
+                    .set(State::Failed("bisync needs a resync".into()))
+                    .await
+            }
+            Outcome::Failed(err) => indicator.set(State::Failed(err.clone())).await,
+            Outcome::Unauthorized => {}
+        }
+        match &outcome {
+            Outcome::Synced { conflicts } if !conflicts.is_empty() => {
                 desktop::notify(
                     "Sync conflicts",
                     &format!(
-                        "{conflicts} file(s) changed on both sides. The newer version won, \
-                         the older one was kept with a .conflict suffix."
+                        "{} file(s) changed on both sides. The newer version won, \
+                         the older one was kept with a .conflict suffix.",
+                        conflicts.len()
                     ),
                 )
                 .await;
@@ -141,7 +252,7 @@ async fn session(config: &Config, client: &Client, credentials: Credentials) -> 
 
         if matches!(outcome, Outcome::Synced { .. }) {
             failures = 0;
-            let trigger = next_trigger(&mut events, config.debounce(), config.interval()).await;
+            let trigger = next_trigger(events, config.debounce(), config.interval()).await;
             if trigger == Trigger::Unauthorized {
                 return Ok(());
             }
@@ -151,10 +262,22 @@ async fn session(config: &Config, client: &Client, credentials: Credentials) -> 
             failures += 1;
             let delay = retry_delay(failures, config.interval());
             tracing::info!("retrying in {}s", delay.as_secs());
-            tokio::time::sleep(delay).await;
-            if drain(&mut events) {
+            if retry_wait(events, delay).await {
                 return Ok(());
             }
+        }
+    }
+}
+
+/// Waits out `delay`, or less if the user asks for a sync. Other triggers are dropped,
+/// the retry covers them. True if one was `Unauthorized`.
+async fn retry_wait(events: &mut Receiver<Trigger>, delay: Duration) -> bool {
+    let deadline = Instant::now() + delay;
+    loop {
+        match tokio::time::timeout_at(deadline, events.recv()).await {
+            Ok(Some(Trigger::Unauthorized)) => return true,
+            Ok(Some(Trigger::Manual)) | Err(_) => return drain(events),
+            Ok(_) => continue,
         }
     }
 }
@@ -179,18 +302,18 @@ fn drain(events: &mut Receiver<Trigger>) -> bool {
 /// Returns early on `Unauthorized`.
 async fn next_trigger(events: &mut Receiver<Trigger>, quiet: Duration, idle: Duration) -> Trigger {
     let first = match tokio::time::timeout(idle, events.recv()).await {
-        Ok(event) => event.expect("the session holds a sender"),
+        Ok(event) => event.expect("the daemon holds a sender"),
         Err(_) => Trigger::Timer,
     };
     tracing::debug!("triggered by {first:?}");
-    if first == Trigger::Unauthorized {
+    if matches!(first, Trigger::Unauthorized | Trigger::Manual) {
         return first;
     }
     let deadline = Instant::now() + MAX_DEBOUNCE;
     loop {
         let wait = quiet.min(deadline.saturating_duration_since(Instant::now()));
         match tokio::time::timeout(wait, events.recv()).await {
-            Ok(Some(Trigger::Unauthorized)) => return Trigger::Unauthorized,
+            Ok(Some(trigger @ (Trigger::Unauthorized | Trigger::Manual))) => return trigger,
             Ok(_) => continue,
             Err(_) => return first,
         }
@@ -212,7 +335,9 @@ pub async fn sync(
         outcome = Outcome::Unauthorized;
     }
     match &outcome {
-        Outcome::Synced { conflicts } => tracing::info!("in sync ({conflicts} conflicts)"),
+        Outcome::Synced { conflicts } => {
+            tracing::info!("in sync ({} conflicts)", conflicts.len())
+        }
         Outcome::NeedsResync => tracing::error!("bisync still needs a resync after one"),
         Outcome::SafetyAbort { reason, .. } => tracing::error!("{reason}"),
         Outcome::Unauthorized => tracing::error!("the server rejected the app password"),
@@ -290,5 +415,54 @@ mod tests {
         next_trigger(&mut rx, QUIET, IDLE).await;
         assert!(start.elapsed() <= MAX_DEBOUNCE + Duration::from_secs(1));
         feeder.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sync_now_skips_the_debounce() {
+        let (tx, mut rx) = mpsc::channel(TRIGGER_QUEUE);
+        tx.send(Trigger::Local).await.unwrap();
+        tx.send(Trigger::Manual).await.unwrap();
+        let start = Instant::now();
+        assert_eq!(next_trigger(&mut rx, QUIET, IDLE).await, Trigger::Manual);
+        assert!(start.elapsed() < QUIET);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sync_now_cuts_the_retry_delay_short() {
+        let (tx, mut rx) = mpsc::channel(TRIGGER_QUEUE);
+        tx.send(Trigger::Local).await.unwrap();
+        tx.send(Trigger::Manual).await.unwrap();
+        let start = Instant::now();
+        assert!(!retry_wait(&mut rx, IDLE).await);
+        assert!(start.elapsed() < IDLE);
+
+        // without one, the full delay passes
+        tx.send(Trigger::Remote).await.unwrap();
+        let start = Instant::now();
+        assert!(!retry_wait(&mut rx, IDLE).await);
+        assert!(start.elapsed() >= IDLE);
+    }
+
+    #[tokio::test]
+    async fn pause_is_kept_in_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("state/paused");
+        let pause = Pause::load(file.clone());
+        assert!(!pause.is_paused());
+
+        pause.set(true);
+        assert!(file.exists());
+        assert!(Pause::load(file.clone()).is_paused());
+
+        let waiting = tokio::spawn({
+            let pause = pause.clone();
+            async move { pause.resumed().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        pause.set(false);
+        waiting.await.unwrap();
+        assert!(!file.exists());
+        assert!(!Pause::load(file).is_paused());
     }
 }

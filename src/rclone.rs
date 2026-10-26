@@ -43,7 +43,8 @@ pub enum Mode {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     Synced {
-        conflicts: usize,
+        /// The kept loser copies, relative to the synced folder.
+        conflicts: Vec<PathBuf>,
     },
     NeedsResync,
     /// rclone refused to sync; `forceable` if `--force` overrides it.
@@ -155,7 +156,13 @@ impl Bisync {
 
         // rclone logs everything to stderr
         let mut lines = BufReader::new(child.stderr.take().expect("piped stderr")).lines();
-        let mut scan = Scan::default();
+        let mut scan = Scan {
+            roots: vec![
+                self.local.to_string_lossy().into_owned(),
+                self.remote.clone(),
+            ],
+            ..Scan::default()
+        };
         while let Some(line) = lines.next_line().await? {
             let entry = LogEntry::parse(&line);
             match entry.stats() {
@@ -264,7 +271,9 @@ fn mib(bytes: f64) -> String {
 /// What a bisync run reported, collected from its log entries.
 #[derive(Default)]
 struct Scan {
-    conflicts: usize,
+    /// The two paths as rclone was given them; logged file paths start with one.
+    roots: Vec<String>,
+    conflicts: Vec<PathBuf>,
     needs_resync: bool,
     safety_abort: Option<(String, bool)>,
     first_error: Option<String>,
@@ -279,7 +288,7 @@ impl Scan {
         if (lower.contains("renaming path1 copy") || lower.contains("renaming path2 copy"))
             && !lower.contains("not renaming")
         {
-            self.conflicts += 1;
+            self.conflicts.push(self.renamed_copy(msg));
         }
         // --resilient words the missing listings of a first run as retryable, but
         // only a resync ever recovers from them
@@ -298,6 +307,22 @@ impl Scan {
         if entry.level == "error" {
             self.first_error.get_or_insert_with(|| msg.to_string());
         }
+    }
+
+    /// The copy a "Renaming PathN copy - <root>/<file>" entry names, relative to the roots.
+    /// The file name may contain " - " itself, so the split is on the first one after "copy".
+    fn renamed_copy(&self, msg: &str) -> PathBuf {
+        let path = msg
+            .find(" copy")
+            .and_then(|start| msg[start..].split_once(" - "))
+            .map_or(msg, |(_, path)| path.trim());
+        let relative = self
+            .roots
+            .iter()
+            .filter(|root| !root.is_empty())
+            .find_map(|root| path.strip_prefix(root.as_str()))
+            .unwrap_or(path);
+        PathBuf::from(relative.trim_start_matches('/'))
     }
 
     fn outcome(self, success: bool) -> Outcome {
@@ -349,7 +374,10 @@ mod tests {
     }
 
     fn scan(lines: &[String], success: bool) -> Outcome {
-        let mut scan = Scan::default();
+        let mut scan = Scan {
+            roots: vec!["/home/x/Nextcloud".into(), ":webdav:Documents".into()],
+            ..Scan::default()
+        };
         for line in lines {
             scan.entry(&LogEntry::parse(line));
         }
@@ -366,16 +394,25 @@ mod tests {
                 ),
                 entry(
                     "notice",
-                    "- Path1     Renaming Path1 copy            - l/a.txt.conflict1",
+                    "- Path1     Renaming Path1 copy            - /home/x/Nextcloud/a.txt.conflict1",
                 ),
                 entry(
                     "notice",
-                    "- Path2     Not renaming Path2 copy, as it was determined the winner - r/a.txt",
+                    "- Path2     Not renaming Path2 copy, as it was determined the winner - :webdav:Documents/a.txt",
+                ),
+                entry(
+                    "notice",
+                    "- Path2     Renaming Path2 copy            - :webdav:Documents/b - c/d.txt.conflict2",
                 ),
             ],
             true,
         );
-        assert_eq!(outcome, Outcome::Synced { conflicts: 1 });
+        assert_eq!(
+            outcome,
+            Outcome::Synced {
+                conflicts: vec!["a.txt.conflict1".into(), "b - c/d.txt.conflict2".into()]
+            }
+        );
     }
 
     #[test]
@@ -390,7 +427,7 @@ mod tests {
             ],
             true,
         );
-        assert_eq!(outcome, Outcome::Synced { conflicts: 0 });
+        assert_eq!(outcome, Outcome::Synced { conflicts: vec![] });
     }
 
     #[test]
@@ -541,14 +578,14 @@ mod tests {
             );
             assert_eq!(
                 f.bisync.sync(Mode::Normal).await.unwrap(),
-                Outcome::Synced { conflicts: 0 }
+                Outcome::Synced { conflicts: vec![] }
             );
             assert_eq!(read(f.local.join("a.txt")), "remote");
 
             write(&f.local.join("b.txt"), "local", Duration::ZERO);
             assert_eq!(
                 f.bisync.sync(Mode::Normal).await.unwrap(),
-                Outcome::Synced { conflicts: 0 }
+                Outcome::Synced { conflicts: vec![] }
             );
             assert_eq!(read(f.remote.join("b.txt")), "local");
         }
@@ -577,7 +614,9 @@ mod tests {
             );
             assert_eq!(
                 f.bisync.run(Mode::Normal).await.unwrap(),
-                Outcome::Synced { conflicts: 1 }
+                Outcome::Synced {
+                    conflicts: vec!["a.txt.conflict1".into()]
+                }
             );
             assert_eq!(read(f.local.join("a.txt")), "newer remote edit");
             assert_eq!(read(f.local.join("a.txt.conflict1")), "older local edit");
@@ -602,7 +641,7 @@ mod tests {
 
             assert_eq!(
                 f.bisync.run(Mode::Force).await.unwrap(),
-                Outcome::Synced { conflicts: 0 }
+                Outcome::Synced { conflicts: vec![] }
             );
             assert_eq!(count(&f.remote), 4);
         }
@@ -646,7 +685,7 @@ mod tests {
             write(&f.local.join(".~lock.doc.odt#"), "lock", Duration::ZERO);
             assert_eq!(
                 f.bisync.run(Mode::Normal).await.unwrap(),
-                Outcome::Synced { conflicts: 0 }
+                Outcome::Synced { conflicts: vec![] }
             );
             assert!(f.remote.join("doc.odt").exists());
             assert!(!f.remote.join(".owncloudsync.log").exists());

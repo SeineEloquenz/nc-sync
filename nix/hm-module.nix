@@ -19,6 +19,7 @@ let
     debounce = cfg.debounce;
     exclude = cfg.exclude;
     rclone_args = cfg.rcloneArgs;
+    tray = cfg.tray;
   };
 in
 {
@@ -85,6 +86,16 @@ in
       default = [ ];
       example = [ "--bwlimit" "10M" ];
       description = "Extra arguments passed to `rclone bisync`.";
+    };
+
+    tray = lib.mkOption {
+      type = lib.types.nullOr lib.types.bool;
+      default = null;
+      example = false;
+      description = ''
+        Whether to show a status icon in the system tray. On if unset. GNOME needs the
+        AppIndicator extension to display it.
+      '';
     };
   };
 

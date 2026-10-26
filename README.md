@@ -9,8 +9,11 @@ actual syncing; nc-sync decides when to run it and handles the account:
   ones through the server's [notify_push](https://github.com/nextcloud/notify_push)
   websocket. A full sync also runs every few minutes as a fallback.
 - **Desktop notifications** for conflicts, safety aborts and a revoked app password.
+- **Tray icon** showing whether everything is in sync, with "Sync now", pause/resume,
+  shortcuts to the folder and the server, and the last few conflict copies.
 
-No Qt, no GUI.
+No Qt, no GUI toolkit: the tray icon is a plain StatusNotifierItem over D-Bus. On GNOME
+it needs the AppIndicator extension.
 
 ## Behaviour
 
@@ -22,6 +25,7 @@ No Qt, no GUI.
 | One side is completely empty | Sync refuses, even with `--force` |
 | The app password was revoked | The keyring entry is removed and a login notification appears |
 | The server has no notify_push | Remote changes are picked up by the periodic sync only |
+| Paused from the tray | No syncs until resumed, also across restarts; resuming syncs right away |
 
 Temporary, lock and old-client files (`.sync_*.db`, `.~lock.*`, `*.part`, …) never sync;
 see `DEFAULT_EXCLUDES` in `src/config.rs`.
@@ -45,6 +49,7 @@ interval = 300            # seconds between full syncs
 debounce = 3              # seconds of quiet before a sync starts
 exclude = ["*.iso"]       # extra rclone filter patterns
 rclone_args = []          # extra arguments for rclone bisync
+tray = true               # status icon in the system tray
 ```
 
 ## Home Manager

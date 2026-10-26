@@ -5,6 +5,7 @@ mod desktop;
 mod nextcloud;
 mod push;
 mod rclone;
+mod tray;
 mod watch;
 
 use std::path::PathBuf;

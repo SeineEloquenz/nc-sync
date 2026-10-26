@@ -71,6 +71,14 @@ pub struct Config {
     /// Where bisync listings and the filter file live; defaults to the XDG state dir.
     #[serde(default)]
     pub state_dir: Option<PathBuf>,
+
+    /// Show a status icon in the system tray.
+    #[serde(default = "default_tray")]
+    pub tray: bool,
+}
+
+fn default_tray() -> bool {
+    true
 }
 
 fn default_remote_dir() -> String {
@@ -123,6 +131,11 @@ impl Config {
         })
     }
 
+    /// Exists while syncing is paused.
+    pub fn pause_file(&self) -> PathBuf {
+        self.state_dir().join("paused")
+    }
+
     pub fn filter_rules(&self) -> String {
         DEFAULT_EXCLUDES
             .iter()
@@ -152,6 +165,7 @@ mod tests {
         assert_eq!(config.remote_dir, "/");
         assert_eq!(config.interval, 300);
         assert_eq!(config.debounce, 3);
+        assert!(config.tray);
     }
 
     #[test]
