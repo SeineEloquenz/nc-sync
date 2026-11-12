@@ -8,7 +8,7 @@
 }:
 
 let
-  cargo = lib.importTOML "${src}/Cargo.toml";
+  cargo = lib.importTOML (src + "/Cargo.toml");
 in
 rustPlatform.buildRustPackage {
   pname = cargo.package.name;
@@ -24,7 +24,7 @@ rustPlatform.buildRustPackage {
     ];
   };
 
-  cargoLock.lockFile = "${src}/Cargo.lock";
+  cargoLock.lockFile = src + "/Cargo.lock";
 
   nativeBuildInputs = [ makeWrapper ];
 
